@@ -187,6 +187,33 @@ class Tree {
   get(p: string): string | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
   }
+  /** True when `p` is a directory in the tree the edits leave it: it exists on disk as a
+      directory (and no edit has replaced it with a file), or it is the parent of a file an
+      earlier edit created. Directories are not files: edits read them as missing, and no edit
+      may write one (audit section 6 point 6). */
+  isDir(p: string): boolean {
+    if (this.now.has(p)) return false;
+    try {
+      if (statSync(p).isDirectory()) return true;
+    } catch {
+      /* not on disk */
+    }
+    for (const [q, v] of this.now) {
+      if (v !== null && q.startsWith(p + '/')) return true;
+    }
+    return false;
+  }
+  /** Throws `exists` when a file cannot be created at `p`: the path already holds a file, is a
+      directory, or one of its parents is a file (so the directories it needs cannot be made).
+      Without this, the write phase would die on an uncaught EISDIR/EEXIST instead of reporting
+      the failure as exit 1 (audit section 5 point 29). */
+  assertFree(p: string): void {
+    if (this.get(p) !== null || this.isDir(p)) throw new Fail('exists', p);
+    const parts = p.split('/');
+    for (let k = 1; k < parts.length; k++) {
+      if (this.get(parts.slice(0, k).join('/')) !== null) throw new Fail('exists', p);
+    }
+  }
 }
 
 type Edit = (tree: Tree) => void;
@@ -218,7 +245,7 @@ function jsonEdit(v: unknown): Edit | null {
     const text = o.file_text;
     return (tree) => {
       if (!safe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      tree.assertFree(p);
       tree.now.set(p, text);
     };
   }
@@ -295,7 +322,9 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
 // ---------------------------------------------------------------- section 6: unified diffs
 
 const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
-const DIFF_GIT_RE = /^diff --git a\/(\S+) b\/(\S+)[ \t]*$/;
+// Paths in a `diff --git` line may hold spaces (SPEC section 6 puts no restriction on them, and
+// section 3 paths allow spaces): split at the first ` b/`, not at whitespace.
+const DIFF_GIT_RE = /^diff --git a\/(.+?) b\/(.+?)[ \t]*$/;
 
 /** The path of a `--- ` / `+++ ` header line: text after the four characters, up to the first tab, trimmed. */
 function headerPath(line: string): string {
@@ -473,7 +502,7 @@ function unifiedSectionEdit(sec: USection, strict: boolean): Edit {
     if (sec.isCreate) {
       const p = sec.newPath;
       if (!safe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      tree.assertFree(p);
       const plus: string[] = [];
       let lastPlus: ParsedBody | null = null;
       for (const h of sec.hunks) {
@@ -499,7 +528,7 @@ function unifiedSectionEdit(sec: USection, strict: boolean): Edit {
       if (!safe(nw)) throw new Fail('unsafe', nw);
       const before = tree.get(o);
       if (before === null) throw new Fail('missing', o);
-      if (tree.get(nw) !== null) throw new Fail('exists', nw);
+      tree.assertFree(nw);
       let fl = toFileLines(before);
       let d = 0;
       for (const h of sec.hunks) {
@@ -593,7 +622,7 @@ function searchReplaceEdit(b: SRBlock, strict: boolean): Edit {
     const p = b.path;
     if (!safe(p)) throw new Fail('unsafe', p);
     if (b.old.length === 0) {
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      tree.assertFree(p);
       tree.now.set(p, b.nw.length === 0 ? '' : b.nw.join('\n') + '\n');
       return;
     }
@@ -751,7 +780,7 @@ function v4aSectionEdit(s: VSection, strict: boolean): Edit {
     if (s.kind === 'add') {
       const p = s.path;
       if (!safe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      tree.assertFree(p);
       tree.now.set(p, s.lines.length === 0 ? '' : s.lines.join('\n') + '\n');
       return;
     }
@@ -767,7 +796,7 @@ function v4aSectionEdit(s: VSection, strict: boolean): Edit {
     if (s.moveTo !== null && !safe(s.moveTo)) throw new Fail('unsafe', s.moveTo);
     const before = tree.get(p);
     if (before === null) throw new Fail('missing', p);
-    if (s.moveTo !== null && tree.get(s.moveTo) !== null) throw new Fail('exists', s.moveTo);
+    if (s.moveTo !== null) tree.assertFree(s.moveTo);
     let fl = toFileLines(before);
     let cursor = 0;
     for (const ch of s.chunks) {
